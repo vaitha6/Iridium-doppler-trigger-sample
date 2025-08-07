@@ -1409,3 +1409,21 @@ function dopplerRangeMeters(heightKm) {
 
 updatePositions(); // initial update
 setInterval(updatePositions, 2000); // update every 2 seconds
+
+// Add legend to the map
+const legend = L.control({ position: 'bottomright' });
+
+legend.onAdd = function () {
+    const div = L.DomUtil.create('div', 'info legend');
+
+    // Example legend entries
+    div.innerHTML = `
+    <h4>Legend</h4>
+    <i style="background: #3399ff; opacity: 0.6; width: 12px; height: 12px; display: inline-block; margin-right: 5px;"></i> Coverage Area<br>
+    <i style="background: #00FF00; opacity: 0.6; width: 12px; height: 12px; display: inline-block; margin-right: 5px;"></i> Doppler Trigger Area<br>
+  `;
+
+    return div;
+};
+
+legend.addTo(map);
