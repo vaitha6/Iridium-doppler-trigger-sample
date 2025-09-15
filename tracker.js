@@ -1,6 +1,3 @@
-let activeCoverageCircle = null;
-let activeDopplerCircle = null;
-
 const map = L.map('map').setView([0, 0], 2);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors'
@@ -1316,99 +1313,264 @@ const iridiumTLEs = [{
     "launchvehicle": "",
     "launchsite": ""
 }];
-// Define the icon once
+
+
+// Globals
+let activeCoverageCircle = null;
+let activeDopplerPolygon = null;
+let activeHyperbolaBranches = []; // array of 2 polylines for active hyperbola
+
+// Calculations for Doppler cone half angle
+const carrierFreq = 1.621E+09 // Carrier frequency in Hz
+var SatVel  = 7.8E+03 // Orbital velocity in m/s
+const dopplerFreq = 1.6E+04 //Doppler frequency in Hz
+const c_light = 3E+08 // Speed of light in m/s
+
+// Half-angle of doppler cone
+var dopplerAngleRad = Math.acos(dopplerFreq* c_light/(SatVel * carrierFreq))
+
+const rEarthKm = 6378.14;
+const elevationAngleRad = (90 - 8.2) * Math.PI / 180; // minimum elevation
+
 const satelliteIcon = L.icon({
     iconUrl: 'sat1.png',
     iconSize: [32, 32],
-    iconAnchor: [16, 16], // center
+    iconAnchor: [16, 16],
     popupAnchor: [0, -16]
 });
 
-// Create markers
+
+// Ground coverage radius based on satellite altitude
+function groundRangeMeters(heightKm) {
+    const rDirectLineKm = Math.sqrt(
+        Math.pow(rEarthKm * Math.cos(elevationAngleRad), 2) +
+        Math.pow(rEarthKm + heightKm, 2) -
+        Math.pow(rEarthKm, 2)
+    ) - rEarthKm * Math.cos(elevationAngleRad);
+
+    const rGroundLineKm = Math.sqrt(Math.max(0, Math.pow(rDirectLineKm, 2) - Math.pow(heightKm, 2)));
+    return Math.max(500, rGroundLineKm * 1000); // minimum 500 m
+}
+
+// Generate hyperbola points (doppler arcs) as two separate branches sorted by latitude
+function generateHyperbolaBranches(centerLat, centerLon, X_val, Y_val, aDeg, rDeg, numPoints = 1000) {
+    const leftBranch = [];
+    const rightBranch = [];
+
+    for (let x = -X_val; x <= -0.2; x += 2 / numPoints) {
+        var val = (x*x)/(aDeg*aDeg) - 1;
+        if (val < 0) continue;
+        var y = Math.sqrt(val) * aDeg;
+        if(x**2 < rDeg**2 + aDeg**2/2) {
+            leftBranch.push([centerLat + y, centerLon + x]);
+            leftBranch.push([centerLat - y, centerLon + x]);
+        }
+    }
+
+    for (let x = 0.2; x <= X_val; x += 2 / numPoints) {
+        var val = (x*x)/(aDeg*aDeg) - 1;
+        if (val < 0) continue;
+        var y = Math.sqrt(val) * aDeg;
+        if(x**2 < (rDeg**2 + aDeg**2)/2) {
+            rightBranch.push([centerLat + y, centerLon + x]);
+            rightBranch.push([centerLat - y, centerLon + x]);
+        }
+    }
+
+    // Sort each branch by latitude
+    leftBranch.sort((a,b) => a[0] - b[0]);
+    rightBranch.sort((a,b) => a[0] - b[0]);
+
+    return [leftBranch, rightBranch];
+}
+
+// Generate bounding upper and lower arcs that connect the hyperbola branches (for plotting purposes, a closed polygon is required)
+function circleArcPoints(lat, lon, radiusDeg, lim, numPoints = 50)
+{
+
+    const upperArc = [];
+    const lowerArc = [];
+
+    for (let x = -lim; x <= lim; x += 2 / numPoints) {
+        pos_y = (180/Math.PI)*Math.acos(Math.cos(radiusDeg*Math.PI/180)/Math.cos(x*Math.PI/180));
+        neg_y = -(180/Math.PI)*Math.acos(Math.cos(radiusDeg*Math.PI/180)/Math.cos(x*Math.PI/180));
+
+        upperArc.push([pos_y + lat, x + lon]);
+        lowerArc.push([neg_y + lat, x + lon]);
+    }
+
+    return [upperArc, lowerArc];
+}
+
+// Initialize satellites
 const iridiumSatellites = iridiumTLEs.map(sat => {
     const satrec = satellite.twoline2satrec(sat.tle1, sat.tle2);
-    const marker = L.marker([0, 0], { icon: satelliteIcon }).addTo(map).bindPopup(sat.name);
-    // Create a circle (initially hidden)
-    const coverageCircle = L.circle([0, 0], {
-        radius: 0, // meters
-        color: 'blue',
-        fillColor: '#3399ff',
-        fillOpacity: 0
-    }).addTo(map).setStyle({ opacity: 0 }); // hide initially
 
-    const dopplerCircle = L.circle([0, 0], {
-        radius: 0, // meters
+    // Marker
+    const marker = L.marker([0,0], { icon: satelliteIcon })
+        .addTo(map)
+        .bindPopup(sat.name);
+
+    // Coverage circle
+    const coverageCircle = L.circle([0,0],{
+        radius:0,
+        color:'blue',
+        weight: 1,
+        fillColor:'#3399ff',
+        fillOpacity:0
+    }).addTo(map).setStyle({opacity:0});
+
+    // Hyperbola branches (initially empty)
+    let leftHyper = L.polyline([], {
+        color:'#00FF00',
+        weight:1
+    }).addTo(map).setStyle({opacity:0});
+
+    let rightHyper = L.polyline([], {
+        color:'#00FF00',
+        weight:1
+    }).addTo(map).setStyle({opacity:0});
+
+    const Polygon = L.polygon([], {
         color: 'green',
+        weight: 1,
         fillColor: '#00FF00',
         fillOpacity: 0
-    }).addTo(map).setStyle({ opacity: 0 }); // hide initially
+    }).addTo(map);
 
-// Show circle on marker click
-    marker.on('click', () => {
-        // Hide the previously active circle
-        if (activeCoverageCircle && activeCoverageCircle !== coverageCircle) {
-            activeCoverageCircle.setStyle({ opacity: 0, fillOpacity: 0 });
-            activeDopplerCircle.setStyle({ opacity: 0, fillOpacity: 0 });
+    // Click behavior
+    marker.on('click', ()=>{
+        // Hide previous active overlays
+        if(activeCoverageCircle)
+            activeCoverageCircle.setStyle({opacity: 0, fillOpacity: 0});
+
+        if(activeDopplerPolygon)
+            activeDopplerPolygon.setStyle({opacity: 0, fillOpacity: 0});
+
+        if(activeHyperbolaBranches) {
+            activeHyperbolaBranches.forEach(poly => poly.setStyle({opacity: 0}));
         }
 
-        // Set and show the new active circle
-        coverageCircle.setLatLng(marker.getLatLng());
-        coverageCircle.setStyle({ opacity: 1, fillOpacity: 0.2 });
+        // Compute satellite position
+        var now = new Date();
+        var gmst = satellite.gstime(now);
+        var posVel = satellite.propagate(satrec, now);
+        if(!posVel.position) return;
 
-        dopplerCircle.setLatLng(marker.getLatLng());
-        dopplerCircle.setStyle({ opacity: 1, fillOpacity: 0.2 });
+        var posGd = satellite.eciToGeodetic(posVel.position, gmst);
+        var lat = satellite.degreesLat(posGd.latitude);
+        var lon = satellite.degreesLong(posGd.longitude);
+        var hgt = posGd.height;
+        var Radius = groundRangeMeters(hgt);
 
-        map.panTo(marker.getLatLng());
+        // Show coverage circle
+        coverageCircle.setLatLng([lat, lon]);
+        coverageCircle.setRadius(Radius);
+        coverageCircle.setStyle({opacity:1, fillOpacity:0.2});
+
+        var hyp_param = (180/Math.PI)*Math.asin(hgt/(rEarthKm*Math.tan(dopplerAngleRad)));
+        
+        var radiusDeg = Radius/1.11E+05;
+
+        var X_val = Math.sqrt(((radiusDeg)**2 + hyp_param**2)/2);
+        var Y_val = Math.sqrt(((radiusDeg)**2 - hyp_param**2)/2);
+
+        // Generate and show hyperbola branches
+        [leftBranch, rightBranch] = generateHyperbolaBranches(lat, lon, X_val, Y_val, hyp_param, radiusDeg);
+        leftHyper.setLatLngs(leftBranch).setStyle({opacity:1});
+        rightHyper.setLatLngs(rightBranch).setStyle({opacity:1});
+
+        [upperArc, lowerArc] = circleArcPoints(lat, lon,radiusDeg, X_val, numPoints = 100);
+
+        lowerArc.reverse();
+
+        var polygonCoords = [
+            [lat+Y_val, lon-X_val],
+                ...upperArc,
+            [lat+Y_val, lon+X_val],
+            ...rightBranch,
+            [lat-Y_val, lon+X_val],
+                ...lowerArc,
+            [lat-Y_val, lon-X_val],
+            ...leftBranch,
+        ];
+
+        Polygon.setLatLngs(polygonCoords).setStyle({opacity:0, fillOpacity: 0.2});
+
         activeCoverageCircle = coverageCircle;
-        activeDopplerCircle = dopplerCircle;
+        activeDopplerPolygon = Polygon;
+        activeHyperbolaBranches = [leftHyper, rightHyper];
+
+        map.panTo([lat, lon]);
     });
 
-    return { name: sat.name, satrec, marker, coverageCircle, dopplerCircle };
+    return {name:sat.name, satrec, marker, coverageCircle, Polygon, leftHyper, rightHyper};
 });
 
 
-// Update positions every 2 seconds
-function updatePositions() {
+// Update positions
+function updatePositions(){
     const now = new Date();
     const gmst = satellite.gstime(now);
 
-    iridiumSatellites.forEach(sat => {
-        const posVel = satellite.propagate(sat.satrec, now);
-        if (!posVel.position) return;
+    iridiumSatellites.forEach(sat=>{
+        var posVel = satellite.propagate(sat.satrec, now);
+        if(!posVel.position) return;
 
-        const posGd = satellite.eciToGeodetic(posVel.position, gmst);
-        const lat = satellite.degreesLat(posGd.latitude);
-        const lon = satellite.degreesLong(posGd.longitude);
-        const hgt = posGd.height;
+        var posGd = satellite.eciToGeodetic(posVel.position, gmst);
+        var lat = satellite.degreesLat(posGd.latitude);
+        var lon = satellite.degreesLong(posGd.longitude);
+        var hgt = posGd.height;
 
+        // Move marker
         sat.marker.setLatLng([lat, lon]);
 
-        // Update coverage circle
-        sat.coverageCircle.setLatLng([lat, lon]);
-        sat.coverageCircle.setRadius(groundRangeMeters(hgt)); // meters
+        // Update coverage circle if active
+        if(activeCoverageCircle === sat.coverageCircle){
+            sat.coverageCircle.setLatLng([lat, lon]);
+            sat.coverageCircle.setRadius(groundRangeMeters(hgt)); // meters
+    
+            var radiusDeg = groundRangeMeters(hgt)/1.11E+05;
+            var velocity = posVel.velocity;
+            SatVel = Math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2) * 1000; // m/s
+            dopplerAngleRad = Math.acos(dopplerFreq * c_light / (SatVel * carrierFreq))
 
-        sat.dopplerCircle.setLatLng([lat, lon]);
-        sat.dopplerCircle.setRadius(dopplerRangeMeters(hgt)); // meters
+            var hyp_param = (180/Math.PI)*Math.asin(hgt/(rEarthKm*Math.tan(dopplerAngleRad)));
+
+            var X_val = Math.sqrt(((radiusDeg)**2 + hyp_param**2)/2);
+            var Y_val = Math.sqrt(((radiusDeg)**2 - hyp_param**2)/2);
+
+            // Update hyperbola branches
+            [leftBranch, rightBranch] = generateHyperbolaBranches(lat, lon, X_val, Y_val, hyp_param, radiusDeg);
+            sat.leftHyper.setLatLngs(leftBranch);
+            sat.rightHyper.setLatLngs(rightBranch);
+
+            [upperArc, lowerArc] = circleArcPoints(lat, lon,radiusDeg, X_val, numPoints = 100);
+
+            lowerArc.reverse();
+
+            var polygonCoords = [
+                [lat+Y_val, lon-X_val],
+                ...upperArc,
+                [lat+Y_val, lon+X_val],
+                ...rightBranch,
+                [lat-Y_val, lon+X_val],
+                ...lowerArc,
+                [lat-Y_val, lon-X_val],
+                ...leftBranch,
+            ];
+
+            sat.Polygon.setLatLngs(polygonCoords).setStyle({opacity:0, fillOpacity: 0.2});
+
+            activeHyperbolaBranches = [sat.leftHyper, sat.rightHyper];
+            activeDopplerPolygon = sat.Polygon;
+        }
     });
 }
 
-var rEarthKm = 6378.14;
-var elevationAngleRad = (90 - 8.2) / 180 * Math.PI;
-function groundRangeMeters(heightKm) {
-    var rDirectLineKm = Math.sqrt(Math.pow(rEarthKm * Math.cos(elevationAngleRad), 2) + Math.pow(rEarthKm + heightKm, 2) - Math.pow(rEarthKm, 2)) - rEarthKm * Math.cos(elevationAngleRad);
-    var rGroundLineKm = Math.sqrt(Math.pow(rDirectLineKm, 2) - Math.pow(heightKm, 2));
-    return Math.round(rGroundLineKm * 1000)
-}
+updatePositions();
+setInterval(updatePositions, 2000);
 
-var dopplerAngleRad = (90 - 60) / 180 * Math.PI;
-function dopplerRangeMeters(heightKm) {
-    var rDirectLineKm = Math.sqrt(Math.pow(rEarthKm * Math.cos(dopplerAngleRad), 2) + Math.pow(rEarthKm + heightKm, 2) - Math.pow(rEarthKm, 2)) - rEarthKm * Math.cos(dopplerAngleRad);
-    var rGroundLineKm = Math.sqrt(Math.pow(rDirectLineKm, 2) - Math.pow(heightKm, 2));
-    return Math.round(rGroundLineKm * 1000)
-}
-
-updatePositions(); // initial update
-setInterval(updatePositions, 2000); // update every 2 seconds
 
 // Add legend to the map
 const legend = L.control({ position: 'bottomright' });
